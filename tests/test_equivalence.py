@@ -74,3 +74,13 @@ def test_close_draft_gets_partial_acceptance():
     out, m = d.generate_ids(PROMPTS[1], max_new_tokens=60, mode="specdec")
     assert out == ref
     assert 0.1 < m.draft_acceptance_rate < 1.0      # accept AND reject paths both exercised
+
+
+def test_dynamic_controller_explores_draft_model():
+    """v2 regression: with the neutral prior, hybrid_dynamic never tried the draft model."""
+    target = _tiny(0, 3)
+    d = HybridSpecDecoder(target, None, draft_model=_perturbed_copy(target, 0.1, 7), device="cpu")
+    ref, _ = d.generate_ids(PROMPTS[1], max_new_tokens=60, mode="autoregressive")
+    out, m = d.generate_ids(PROMPTS[1], max_new_tokens=60, mode="hybrid_dynamic")
+    assert out == ref
+    assert "draft" in m.source_history and m.draft_forwards > 0

@@ -161,6 +161,11 @@ class DynamicLengthController:
     where c = (draft forward time) / (target step time) is measured online.
     If the best achievable ratio is <= 1, plain autoregressive decoding wins
     and the controller routes to AR.
+
+    Exploration: the estimates only improve when the draft model is actually
+    used, so the controller drafts unconditionally until it has MIN_DRAFT_OBS
+    observations, and re-probes once after every PROBE_EVERY consecutive AR
+    fallbacks so a stale pessimistic estimate can recover.
     """
 
     WINDOW_SIZE = 20
@@ -169,6 +174,8 @@ class DynamicLengthController:
     HIGH_THRESH = 0.8
     LOW_THRESH = 0.4
     EMA = 0.9
+    MIN_DRAFT_OBS = 3
+    PROBE_EVERY = 16
 
     def __init__(self, initial_draft_len: int = 4, initial_cost_ratio: float = 0.5) -> None:
         self._draft_len: dict[str, int] = {"SA": initial_draft_len, "draft": initial_draft_len}
@@ -176,6 +183,8 @@ class DynamicLengthController:
         self._t_target: float | None = None      # seconds per target step
         self._t_draft: float | None = None       # seconds per draft-model forward
         self._init_cost = initial_cost_ratio
+        self._initial_draft_len = initial_draft_len
+        self._ar_streak = 0                      # consecutive draft->AR fallbacks
 
     # --- acceptance tracking ---------------------------------------------
     def update(self, source: str, accepted: int, proposed: int) -> None:
@@ -223,6 +232,20 @@ class DynamicLengthController:
             if s > best:
                 best_k, best = k, s
         return best_k, best
+
+    def choose_draft_len(self) -> int:
+        """Draft length to use this step (0 = route to AR), with exploration."""
+        if len(self._window["draft"]) < self.MIN_DRAFT_OBS:
+            return self._initial_draft_len
+        best_k, _ = self.best_draft_plan()
+        if best_k > 0:
+            self._ar_streak = 0
+            return best_k
+        self._ar_streak += 1
+        if self._ar_streak >= self.PROBE_EVERY:
+            self._ar_streak = 0
+            return self.MIN_DRAFT_LEN
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +358,7 @@ class HybridSpecDecoder:
                     source, k = "SA", min(len(sa_drafts), max_k)
             if source == "autoregressive" and uses_draft and max_k > 0:
                 if mode == "hybrid_dynamic":
-                    best_k, gain = dlc.best_draft_plan()
+                    best_k = dlc.choose_draft_len()
                     if best_k > 0:
                         source, k = "draft", min(best_k, max_k)
                 else:
@@ -367,7 +390,8 @@ class HybridSpecDecoder:
                 n_draft_fwd = k                          # catch-up + (k-1) single-token steps
                 tracker.count_draft_forward(n_draft_fwd)
                 self._sync()
-                dlc.observe_draft_forward((time.perf_counter() - t0) / n_draft_fwd)
+                if len(catch_up) <= 2:                   # steady state; skip prefill-sized catch-ups
+                    dlc.observe_draft_forward((time.perf_counter() - t0) / n_draft_fwd)
                 if not greedy:
                     q_rows = torch.stack(q_list)
 

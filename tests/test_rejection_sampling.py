@@ -65,3 +65,16 @@ def test_expected_tokens():
     assert expected_tokens_per_step(0.0, 5) == 1.0
     assert expected_tokens_per_step(1.0, 5) == 6.0
     assert abs(expected_tokens_per_step(0.5, 2) - 1.75) < 1e-9
+
+
+def test_controller_routes_to_ar_and_reprobes():
+    from src.speculative_decode import DynamicLengthController as DLC
+    c = DLC(initial_draft_len=4)
+    assert c.choose_draft_len() == 4                  # explores before it has data
+    for _ in range(DLC.MIN_DRAFT_OBS):
+        c.update("draft", accepted=0, proposed=4)     # draft model is useless here
+    c.observe_target_step(1.0)
+    c.observe_draft_forward(0.5)
+    picks = [c.choose_draft_len() for _ in range(DLC.PROBE_EVERY)]
+    assert picks[:-1] == [0] * (DLC.PROBE_EVERY - 1)  # routes to AR...
+    assert picks[-1] == DLC.MIN_DRAFT_LEN             # ...but periodically re-probes
