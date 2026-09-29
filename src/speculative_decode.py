@@ -1,25 +1,38 @@
 """
-Hybrid Speculative Decoding Engine
-===================================
-Implements five decoding modes:
-  - autoregressive    : vanilla greedy/sampling, no speculation
-  - specdec           : draft-model-only speculative decoding (fixed draft length)
-  - sa_only           : suffix-automaton-only speculation (fixed draft length)
-  - hybrid_fixed      : SA + draft model, fixed draft length
-  - hybrid_dynamic    : SA + draft model, DYNAMIC draft length (novel contribution)
+Hybrid Speculative Decoding Engine (v2)
+=======================================
+Five decoding modes:
+  - autoregressive : one target forward per token, no speculation
+  - specdec        : draft-model speculation, fixed draft length
+  - sa_only        : suffix-automaton speculation (zero forward passes to draft)
+  - hybrid_fixed   : SA when it matches, otherwise the draft model, fixed length
+  - hybrid_dynamic : SA / draft model / AR chosen per step by a cost-aware controller
 
-Dynamic draft length is the explicit "future work" item from Baseten's Jan 27 2026
-SA MTP blog post — this implementation uses a rolling-window acceptance rate
-controller, one tracker per source (SA vs draft model).
+Correctness
+-----------
+Verification uses the speculative sampling rule of Leviathan et al. (2023) and
+Chen et al. (2023). For draft token x with draft distribution q and target
+distribution p:
 
-KV Cache: both target and draft models maintain running key-value caches across
-decoding steps, so each forward pass only processes NEW tokens (O(n)) rather
-than the full sequence (O(L)). This is the critical fix that makes speculative
-decoding faster than autoregressive.
+    accept with probability  min(1, p(x) / q(x))
+    on rejection, sample from  normalize(max(0, p - q))
 
-Mathematical correctness: rejection sampling follows the exact algorithm from
-  Leviathan et al. (2023) "Fast Inference from Transformers via Speculative Decoding"
-ensuring the output distribution equals the target model's distribution.
+For suffix-automaton drafts q is one-hot at x, so acceptance is p(x) and the
+residual is p with x zeroed out and renormalized. In both cases the emitted
+token is distributed exactly as p. Greedy decoding (temperature = 0) accepts a
+draft iff it equals the target argmax.
+
+Execution model
+---------------
+Invariant: the target KV cache holds every committed token except the last one,
+``pending``. Each step feeds ``[pending] + drafts`` in ONE target forward:
+row i of the logits verifies drafts[i], and row n yields the bonus token. After
+acceptance the cache is cropped to the accepted prefix and the sampled token
+becomes the new ``pending``. So every step - speculative or autoregressive -
+costs exactly one target forward.
+
+The draft model is synced lazily: its KV cache only catches up on committed
+tokens when the controller actually routes to it.
 """
 
 from __future__ import annotations
@@ -37,19 +50,117 @@ Mode = Literal["autoregressive", "specdec", "sa_only", "hybrid_fixed", "hybrid_d
 
 
 # ---------------------------------------------------------------------------
-# Dynamic draft length controller
+# Sampling primitives (pure functions - unit tested in tests/)
+# ---------------------------------------------------------------------------
+
+def process_logits(logits: torch.Tensor, temperature: float, top_p: float = 1.0) -> torch.Tensor:
+    """Turn logits [..., V] into the sampling distribution (temperature + top-p).
+
+    The SAME function is used for the target, the draft model and plain AR
+    sampling, so p and q are always comparable.
+    """
+    probs = F.softmax(logits.float() / temperature, dim=-1)
+    if top_p < 1.0:
+        sorted_p, idx = probs.sort(dim=-1, descending=True)
+        cum = sorted_p.cumsum(dim=-1)
+        sorted_p = sorted_p.masked_fill((cum - sorted_p) > top_p, 0.0)
+        probs = torch.zeros_like(probs).scatter(-1, idx, sorted_p)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+    return probs
+
+
+def greedy_verify(logit_rows: torch.Tensor, draft_tokens: list[int]) -> tuple[int, int]:
+    """Greedy verification. logit_rows: [n+1, V].
+
+    Returns (num_accepted, next_token). One device->host sync for the whole step.
+    """
+    argmax = logit_rows.argmax(dim=-1).tolist()
+    for i, tok in enumerate(draft_tokens):
+        if tok != argmax[i]:
+            return i, argmax[i]
+    return len(draft_tokens), argmax[len(draft_tokens)]
+
+
+def rejection_sample(
+    p_rows: torch.Tensor,
+    draft_tokens: list[int],
+    q_rows: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> tuple[int, int]:
+    """Exact speculative sampling.
+
+    Args:
+        p_rows:       [n+1, V] target distributions (row n is the bonus row).
+        draft_tokens: n proposed tokens.
+        q_rows:       [n, V] draft distributions, or None for deterministic
+                      (suffix-automaton) drafts, i.e. q one-hot at the draft.
+    Returns:
+        (num_accepted, next_token) where next_token is the residual sample on
+        rejection, or the bonus sample if every draft was accepted.
+    """
+    dev = p_rows.device
+    for i, x in enumerate(draft_tokens):
+        p = p_rows[i]
+        if q_rows is None:
+            accept_prob = p[x]
+        else:
+            qx = q_rows[i, x]
+            accept_prob = torch.clamp(p[x] / qx, max=1.0) if qx > 0 else torch.tensor(1.0, device=dev)
+        u = torch.rand((), device=dev, generator=generator)
+        if u < accept_prob:
+            continue
+        # Rejected: sample from the residual normalize(max(0, p - q)).
+        if q_rows is None:
+            residual = p.clone()
+            residual[x] = 0.0           # (p - onehot(x))_+  ==  p with x removed
+        else:
+            residual = (p - q_rows[i]).clamp_min(0.0)
+        z = residual.sum()
+        if z <= 0:                      # only reachable if p == q (then we'd never reject)
+            residual, z = p, p.sum()
+        tok = torch.multinomial(residual / z, 1, generator=generator).item()
+        return i, tok
+    tok = torch.multinomial(p_rows[len(draft_tokens)], 1, generator=generator).item()
+    return len(draft_tokens), tok
+
+
+def expected_tokens_per_step(alpha: float, k: int) -> float:
+    """E[tokens emitted per verify step] with i.i.d. per-token acceptance alpha
+    and k drafts: (1 - alpha^(k+1)) / (1 - alpha). Includes the bonus/residual token."""
+    if alpha >= 1.0:
+        return float(k + 1)
+    return (1.0 - alpha ** (k + 1)) / (1.0 - alpha)
+
+
+def _crop_kv(kv, keep: int):
+    """Crop a KV cache to its first `keep` positions (works across transformers versions)."""
+    if kv is None:
+        return None
+    if hasattr(kv, "crop"):
+        cur = kv.get_seq_length()
+        if cur > keep:
+            kv.crop(-(cur - keep))      # negative = drop that many tokens (4.x and 5.x)
+        return kv
+    return tuple((k[:, :, :keep, :], v[:, :, :keep, :]) for k, v in kv)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic length / source controller
 # ---------------------------------------------------------------------------
 
 class DynamicLengthController:
     """
-    Adapts draft token count using a rolling-window acceptance rate per source.
+    Per-source rolling acceptance tracking plus a cost model.
 
-    - rate > HIGH_THRESH → increase draft_len
-    - rate < LOW_THRESH  → decrease draft_len
-    - Clamps to [MIN_DRAFT_LEN, MAX_DRAFT_LEN]
+    SA drafts cost ~0 to produce, so their length follows a simple threshold
+    rule (grow above HIGH_THRESH, shrink below LOW_THRESH) that trims wasted
+    verification work when acceptance is poor.
 
-    Separate windows for SA and draft-model sources because they have
-    different base acceptance rates.
+    Draft-model drafts are NOT free. Their length is chosen to maximise
+        E[tokens per step] / (1 + k * c)
+    where c = (draft forward time) / (target step time) is measured online.
+    If the best achievable ratio is <= 1, plain autoregressive decoding wins
+    and the controller routes to AR.
     """
 
     WINDOW_SIZE = 20
@@ -57,23 +168,24 @@ class DynamicLengthController:
     MAX_DRAFT_LEN = 10
     HIGH_THRESH = 0.8
     LOW_THRESH = 0.4
+    EMA = 0.9
 
-    def __init__(self, initial_draft_len: int = 4) -> None:
+    def __init__(self, initial_draft_len: int = 4, initial_cost_ratio: float = 0.5) -> None:
         self._draft_len: dict[str, int] = {"SA": initial_draft_len, "draft": initial_draft_len}
         self._window: dict[str, list[tuple[int, int]]] = {"SA": [], "draft": []}
+        self._t_target: float | None = None      # seconds per target step
+        self._t_draft: float | None = None       # seconds per draft-model forward
+        self._init_cost = initial_cost_ratio
 
+    # --- acceptance tracking ---------------------------------------------
     def update(self, source: str, accepted: int, proposed: int) -> None:
-        if source not in self._window:
+        if source not in self._window or proposed == 0:
             return
         window = self._window[source]
         window.append((proposed, accepted))
         if len(window) > self.WINDOW_SIZE:
             window.pop(0)
-        total_p = sum(p for p, _ in window)
-        total_a = sum(a for _, a in window)
-        if total_p == 0:
-            return
-        rate = total_a / total_p
+        rate = self.get_estimated_rate(source)
         if rate > self.HIGH_THRESH:
             self._draft_len[source] = min(self._draft_len[source] + 1, self.MAX_DRAFT_LEN)
         elif rate < self.LOW_THRESH:
@@ -83,13 +195,34 @@ class DynamicLengthController:
         return self._draft_len.get(source, 4)
 
     def get_estimated_rate(self, source: str) -> float:
-        """Return rolling-window acceptance rate for a source. 0.5 if no data yet."""
+        """Rolling acceptance rate; 0.5 neutral prior before any data."""
         window = self._window.get(source, [])
-        if not window:
-            return 0.5  # neutral prior — assume beneficial until proven otherwise
         total_p = sum(p for p, _ in window)
         total_a = sum(a for _, a in window)
         return total_a / total_p if total_p > 0 else 0.5
+
+    # --- cost tracking -----------------------------------------------------
+    def observe_target_step(self, seconds: float) -> None:
+        self._t_target = seconds if self._t_target is None else self.EMA * self._t_target + (1 - self.EMA) * seconds
+
+    def observe_draft_forward(self, seconds: float) -> None:
+        self._t_draft = seconds if self._t_draft is None else self.EMA * self._t_draft + (1 - self.EMA) * seconds
+
+    def cost_ratio(self) -> float:
+        if self._t_target and self._t_draft:
+            return self._t_draft / self._t_target
+        return self._init_cost
+
+    def best_draft_plan(self) -> tuple[int, float]:
+        """Return (k, speedup_vs_AR) maximising E[tokens]/(1 + k*c) for the draft model."""
+        alpha = self.get_estimated_rate("draft")
+        c = self.cost_ratio()
+        best_k, best = 0, 1.0
+        for k in range(1, self.MAX_DRAFT_LEN + 1):
+            s = expected_tokens_per_step(alpha, k) / (1.0 + k * c)
+            if s > best:
+                best_k, best = k, s
+        return best_k, best
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +230,7 @@ class DynamicLengthController:
 # ---------------------------------------------------------------------------
 
 class HybridSpecDecoder:
-    """
-    Unified speculative decoding engine supporting all five modes.
-
-    Both target and draft models maintain running KV caches so each
-    forward pass only processes new tokens — O(draft_len) not O(seq_len).
-    """
+    """Unified speculative decoding engine supporting all five modes (batch size 1)."""
 
     def __init__(
         self,
@@ -117,417 +245,182 @@ class HybridSpecDecoder:
         self.draft_model = draft_model
         self.draft_tokenizer = draft_tokenizer or target_tokenizer
         self.device = device
-
         self.target_model.eval()
         if self.draft_model is not None:
             self.draft_model.eval()
 
+    def _sync(self) -> None:
+        if str(self.device).startswith("cuda"):
+            torch.cuda.synchronize()
+
     def warmup(self, prompt: str = "Hello", n_warmup: int = 3) -> None:
-        """Run a few throwaway forward passes to warm up CUDA kernels and caches."""
-        input_ids = self.target_tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
+        """Throwaway forwards so CUDA kernel/JIT setup isn't timed."""
+        ids = self.target_tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
         with torch.no_grad():
             for _ in range(n_warmup):
-                self.target_model(input_ids, use_cache=False)
+                self.target_model(ids, use_cache=False)
                 if self.draft_model is not None:
-                    self.draft_model(input_ids, use_cache=False)
-        if self.device == "cuda":
-            torch.cuda.synchronize()
+                    self.draft_model(ids, use_cache=False)
+        self._sync()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def generate(
+    def generate(self, prompt: str, **kwargs) -> tuple[str, GenerationMetrics]:
+        """Tokenize, generate, decode. See generate_ids for arguments."""
+        ids = self.target_tokenizer(prompt, return_tensors="pt").input_ids[0].tolist()
+        new_ids, metrics = self.generate_ids(ids, eos_token_id=self.target_tokenizer.eos_token_id, **kwargs)
+        return self.target_tokenizer.decode(new_ids, skip_special_tokens=True), metrics
+
+    @torch.no_grad()
+    def generate_ids(
         self,
-        prompt: str,
+        prompt_ids: list[int],
         max_new_tokens: int = 200,
         mode: Mode = "hybrid_dynamic",
         num_draft_tokens: int = 4,
-        sa_threshold: int = 2,       # lowered from 4 → SA fires on 2-token matches
-        sa_max_draft_len: int = 10,  # SA drafts are free (dict lookups) — propose more tokens
+        sa_threshold: int = 2,
+        sa_max_draft_len: int = 10,
         temperature: float = 0.0,
         top_p: float = 1.0,
-    ) -> tuple[str, GenerationMetrics]:
-        """Generate text using the specified decoding mode. Returns (text, metrics)."""
+        eos_token_id: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> tuple[list[int], GenerationMetrics]:
+        """Generate up to max_new_tokens after prompt_ids. Returns (new_token_ids, metrics)."""
+        assert len(prompt_ids) >= 1
         tracker = MetricsTracker()
-        if self.device == "cuda":
-            torch.cuda.synchronize()
+        greedy = temperature == 0.0
+        uses_sa = mode in ("sa_only", "hybrid_fixed", "hybrid_dynamic")
+        uses_draft = mode in ("specdec", "hybrid_fixed", "hybrid_dynamic") and self.draft_model is not None
+        dev = self.device
+
+        self._sync()
         t_start = time.perf_counter()
 
-        # Tokenize prompt
-        input_ids = self.target_tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
-        prompt_len = input_ids.shape[1]
-
-        # Build suffix automaton from prompt tokens
         dsa = DualSuffixAutomaton()
-        if mode in ("sa_only", "hybrid_fixed", "hybrid_dynamic"):
-            dsa.build_from_prompt(input_ids[0].tolist())
-
-        # Dynamic length controller
+        if uses_sa:
+            dsa.build_from_prompt(list(prompt_ids))
         dlc = DynamicLengthController(initial_draft_len=num_draft_tokens)
 
-        uses_draft = mode in ("specdec", "hybrid_fixed", "hybrid_dynamic")
+        # --- Prefill: target KV holds all prompt tokens except the last ('pending').
+        committed: list[int] = list(prompt_ids)
+        t_kv = None
+        if len(committed) > 1:
+            out = self.target_model(torch.tensor([committed[:-1]], device=dev), use_cache=True)
+            t_kv = out.past_key_values
+            tracker.count_target_forward()
+        pending = committed[-1]
 
-        # ------------------------------------------------------------------
-        # Prefill: single forward pass to populate KV caches
-        # ------------------------------------------------------------------
-        t_prefill = time.perf_counter()
+        d_kv = None          # draft-model KV cache
+        d_synced = 0         # number of committed tokens whose KV is in d_kv
+        n_prompt = len(prompt_ids)
+        first_token_recorded = False
 
-        t_out = self.target_model(input_ids, use_cache=True)
-        target_past_kv = t_out.past_key_values
-        target_last_logit = t_out.logits[0, -1, :]   # P(next | prompt)
+        while len(committed) - n_prompt < max_new_tokens:
+            remaining = max_new_tokens - (len(committed) - n_prompt)
+            max_k = remaining - 1            # each step also emits one sampled token
 
-        draft_past_kv = None
-        draft_last_logit = None
-        if uses_draft and self.draft_model is not None:
-            d_out = self.draft_model(input_ids, use_cache=True)
-            draft_past_kv = d_out.past_key_values
-            draft_last_logit = d_out.logits[0, -1, :]
-
-        tracker.record_ttft(time.perf_counter() - t_prefill)
-
-        generated_ids = input_ids.clone()
-        eos = self.target_tokenizer.eos_token_id
-
-        # ------------------------------------------------------------------
-        # Main generation loop
-        # ------------------------------------------------------------------
-        while (generated_ids.shape[1] - prompt_len) < max_new_tokens:
-            remaining = max_new_tokens - (generated_ids.shape[1] - prompt_len)
-
-            # ==============================================================
-            # Autoregressive mode — one cached target step per iteration
-            # ==============================================================
-            if mode == "autoregressive":
-                new_tok = self._sample(target_last_logit, temperature, top_p).item()
-                tracker.record_draft_attempt("autoregressive", proposed=1, accepted=1, draft_len=1)
-                if new_tok == eos:
-                    break
-                generated_ids = torch.cat(
-                    [generated_ids, torch.tensor([[new_tok]], device=self.device)], dim=1
-                )
-                dsa.extend(new_tok)
-                # Advance target KV by one token
-                t_out = self.target_model(
-                    torch.tensor([[new_tok]], device=self.device),
-                    past_key_values=target_past_kv,
-                    use_cache=True,
-                )
-                target_past_kv = t_out.past_key_values
-                target_last_logit = t_out.logits[0, -1, :]
-                continue
-
-            # ==============================================================
-            # Speculative modes — decide source and draft length
-            # ==============================================================
-            # Use a sliding window of recent tokens for SA context queries.
-            # Passing the full sequence would walk to the terminal state of the
-            # known prompt string, leaving no forward transitions → SA never fires.
-            context_tokens = generated_ids[0, -64:].tolist()
-
-            if mode == "specdec":
-                draft_len = num_draft_tokens
-                sa_drafts, sa_match = [], 0
-            elif mode == "sa_only":
-                draft_len = sa_max_draft_len
-                sa_drafts, sa_match = dsa.query(context_tokens, max_draft_len=sa_max_draft_len, temperature=temperature)
-            else:  # hybrid_fixed / hybrid_dynamic
-                sa_dl = max(dlc.get_draft_length("SA"), sa_max_draft_len) if mode == "hybrid_dynamic" else sa_max_draft_len
-                draft_dl = dlc.get_draft_length("draft") if mode == "hybrid_dynamic" else num_draft_tokens
-                sa_drafts, sa_match = dsa.query(context_tokens, max_draft_len=sa_dl, temperature=temperature)
-                draft_len = sa_dl if sa_match >= sa_threshold else draft_dl
-
-            draft_len = min(draft_len, remaining)
-            if draft_len <= 0:
-                break
-
-            use_sa = (
-                mode in ("sa_only", "hybrid_fixed", "hybrid_dynamic")
-                and sa_match >= sa_threshold
-                and len(sa_drafts) > 0
-            )
-
-            # Save pre-draft draft KV for resync after acceptance.
-            draft_base_kv = draft_past_kv
-            draft_token_probs: list[float] = []  # populated during draft generation
-
-            if use_sa:
-                source = "SA"
-                draft_tokens = sa_drafts[:draft_len]
-            elif uses_draft and self.draft_model is not None:
-                # Cost-aware routing for hybrid_dynamic:
-                # draft is economical only if expected accepted tokens > 1 (break-even vs AR).
-                # Expected accepted = draft_rate * draft_dl. If <= 1.0, AR fallback is cheaper.
+            # ---------------- choose source + draft length -----------------
+            source, k = "autoregressive", 0
+            sa_drafts: list[int] = []
+            if uses_sa and max_k > 0:
+                sa_len = sa_max_draft_len
                 if mode == "hybrid_dynamic":
-                    draft_rate = dlc.get_estimated_rate("draft")
-                    draft_beneficial = (draft_rate * draft_dl) > 1.0
+                    sa_len = min(dlc.get_draft_length("SA"), sa_max_draft_len)
+                context = committed[-64:]
+                sa_drafts, sa_match = dsa.query(context, max_draft_len=sa_len, temperature=temperature)
+                if sa_match >= sa_threshold and sa_drafts:
+                    source, k = "SA", min(len(sa_drafts), max_k)
+            if source == "autoregressive" and uses_draft and max_k > 0:
+                if mode == "hybrid_dynamic":
+                    best_k, gain = dlc.best_draft_plan()
+                    if best_k > 0:
+                        source, k = "draft", min(best_k, max_k)
                 else:
-                    draft_beneficial = True
+                    source, k = "draft", min(num_draft_tokens, max_k)
 
-                if draft_beneficial:
-                    source = "draft"
-                    draft_tokens, draft_token_probs, draft_past_kv, draft_last_logit = (
-                        self._draft_model_tokens_cached(
-                            draft_last_logit, draft_past_kv, draft_len, temperature
-                        )
-                    )
-                else:
-                    # AR fallback — single target step, no draft overhead
-                    source = "autoregressive"
-                    new_tok = self._sample(target_last_logit, temperature, top_p).item()
-                    tracker.record_draft_attempt("autoregressive", proposed=1, accepted=1, draft_len=1)
-                    if new_tok == eos:
-                        break
-                    generated_ids = torch.cat(
-                        [generated_ids, torch.tensor([[new_tok]], device=self.device)], dim=1
-                    )
-                    dsa.extend(new_tok)
-                    tok_tensor = torch.tensor([[new_tok]], device=self.device)
-                    t_out = self.target_model(tok_tensor, past_key_values=target_past_kv, use_cache=True)
-                    target_past_kv = t_out.past_key_values
-                    target_last_logit = t_out.logits[0, -1, :]
-                    # Keep draft KV in sync so future draft iterations start from the right state
-                    d_out = self.draft_model(tok_tensor, past_key_values=draft_past_kv, use_cache=True)
-                    draft_past_kv = d_out.past_key_values
-                    draft_last_logit = d_out.logits[0, -1, :]
-                    continue
+            # ---------------- produce drafts -------------------------------
+            drafts: list[int] = []
+            q_rows = None
+            if source == "SA":
+                drafts = sa_drafts[:k]
+            elif source == "draft":
+                t0 = time.perf_counter()
+                catch_up = committed[d_synced:]          # always includes `pending`
+                out = self.draft_model(torch.tensor([catch_up], device=dev), past_key_values=d_kv, use_cache=True)
+                d_kv, logit = out.past_key_values, out.logits[0, -1]
+                d_synced = len(committed)
+                q_list = []
+                for i in range(k):
+                    if greedy:
+                        tok = int(logit.argmax())
+                    else:
+                        q = process_logits(logit, temperature, top_p)
+                        tok = torch.multinomial(q, 1, generator=generator).item()
+                        q_list.append(q)
+                    drafts.append(tok)
+                    if i < k - 1:
+                        out = self.draft_model(torch.tensor([[tok]], device=dev), past_key_values=d_kv, use_cache=True)
+                        d_kv, logit = out.past_key_values, out.logits[0, -1]
+                n_draft_fwd = k                          # catch-up + (k-1) single-token steps
+                tracker.count_draft_forward(n_draft_fwd)
+                self._sync()
+                dlc.observe_draft_forward((time.perf_counter() - t0) / n_draft_fwd)
+                if not greedy:
+                    q_rows = torch.stack(q_list)
+
+            # ---------------- ONE target forward: [pending] + drafts -------
+            t0 = time.perf_counter()
+            base = len(committed) - 1                    # tokens currently in t_kv
+            inp = torch.tensor([[pending] + drafts], device=dev)
+            out = self.target_model(inp, past_key_values=t_kv, use_cache=True)
+            t_kv = out.past_key_values
+            rows = out.logits[0]                         # [n+1, V]
+            tracker.count_target_forward()
+
+            if greedy:
+                n_acc, nxt = greedy_verify(rows, drafts)
             else:
-                # sa_only with no match — fall back to single cached autoregressive step
-                source = "autoregressive"
-                new_tok = self._sample(target_last_logit, temperature, top_p).item()
-                tracker.record_draft_attempt("autoregressive", proposed=1, accepted=1, draft_len=1)
-                if new_tok == eos:
-                    break
-                generated_ids = torch.cat(
-                    [generated_ids, torch.tensor([[new_tok]], device=self.device)], dim=1
-                )
-                dsa.extend(new_tok)
-                t_out = self.target_model(
-                    torch.tensor([[new_tok]], device=self.device),
-                    past_key_values=target_past_kv,
-                    use_cache=True,
-                )
-                target_past_kv = t_out.past_key_values
-                target_last_logit = t_out.logits[0, -1, :]
-                continue
+                p_rows = process_logits(rows, temperature, top_p)
+                n_acc, nxt = rejection_sample(p_rows, drafts, q_rows, generator)
+            dlc.observe_target_step(time.perf_counter() - t0)   # .item()/.tolist() above already synced
 
-            # ==============================================================
-            # Verify draft tokens — single cached target forward pass
-            # ==============================================================
-            pre_draft_seq_len = generated_ids.shape[1]
-            (
-                accepted_tokens,
-                bonus_token,
-                target_past_kv,
-                target_last_logit,
-            ) = self._verify_drafts_cached(
-                target_last_logit,
-                target_past_kv,
-                draft_tokens,
-                source,
-                temperature,
-                draft_token_probs,  # pre-computed during generation — no second draft pass needed
-                pre_draft_seq_len,
-            )
+            # ---------------- commit -----------------------------------------
+            t_kv = _crop_kv(t_kv, base + 1 + n_acc)       # keep pending + accepted drafts
+            if source == "draft":
+                # draft KV holds committed + drafts[:k-1]; keep only the accepted ones
+                d_synced = d_synced + min(n_acc, k - 1)
+                d_kv = _crop_kv(d_kv, d_synced)
 
-            proposed = len(draft_tokens)
-            accepted = len(accepted_tokens)
-            tracker.record_draft_attempt(source, proposed=proposed, accepted=accepted, draft_len=proposed)
+            new_tokens = drafts[:n_acc] + [nxt]
+            if source == "autoregressive":
+                tracker.record_draft_attempt("autoregressive", proposed=0, accepted=0, draft_len=0)
+            else:
+                tracker.record_draft_attempt(source, proposed=len(drafts), accepted=n_acc, draft_len=len(drafts))
+                if mode == "hybrid_dynamic":
+                    dlc.update(source, accepted=n_acc, proposed=len(drafts))
 
-            if mode == "hybrid_dynamic":
-                dlc.update(source, accepted=accepted, proposed=proposed)
-
-            # Append accepted + bonus to sequence, update SA and draft KV
-            all_new = accepted_tokens + ([bonus_token] if bonus_token is not None else [])
             hit_eos = False
-            for tok in all_new:
-                generated_ids = torch.cat(
-                    [generated_ids, torch.tensor([[tok]], device=self.device)], dim=1
-                )
-                dsa.extend(tok)
-                if tok == eos:
+            for tok in new_tokens:
+                committed.append(tok)
+                if uses_sa:
+                    dsa.extend(tok)
+                if eos_token_id is not None and tok == eos_token_id:
                     hit_eos = True
                     break
+            pending = committed[-1]
 
-            # Sync draft model KV cache to the committed tokens (accepted + bonus).
-            # Always done regardless of source so draft KV stays in sync for future iterations.
-            # draft_base_kv covers the committed prefix before this iteration's draft/SA tokens,
-            # so running draft on all_new from there gives the correct updated state.
-            if uses_draft and self.draft_model is not None and all_new:
-                sync_ids = torch.tensor([all_new], device=self.device)
-                d_out = self.draft_model(sync_ids, past_key_values=draft_base_kv, use_cache=True)
-                draft_past_kv = d_out.past_key_values
-                draft_last_logit = d_out.logits[0, -1, :]
-
+            if not first_token_recorded:
+                self._sync()
+                tracker.record_ttft(time.perf_counter() - t_start)
+                first_token_recorded = True
             if hit_eos:
                 break
 
-        if self.device == "cuda":
-            torch.cuda.synchronize()
+        self._sync()
         total_time = time.perf_counter() - t_start
-        total_tokens = generated_ids.shape[1] - prompt_len
-        metrics = tracker.finalize(total_tokens=total_tokens, total_time=total_time)
-        decoded = self.target_tokenizer.decode(generated_ids[0][prompt_len:], skip_special_tokens=True)
-        return decoded, metrics
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    def _sample(self, logits: torch.Tensor, temperature: float = 1.0, top_p: float = 1.0) -> torch.Tensor:
-        if temperature == 0.0:
-            return logits.argmax()
-        logits = logits / temperature
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            remove = cumprobs - F.softmax(sorted_logits, dim=-1) > top_p
-            sorted_logits[remove] = -float("inf")
-            logits = torch.zeros_like(logits).scatter_(0, sorted_indices, sorted_logits)
-        probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze()
-
-    def _draft_model_tokens_cached(
-        self,
-        draft_last_logit: torch.Tensor,
-        draft_past_kv: tuple,
-        num_tokens: int,
-        temperature: float,
-    ) -> tuple[list[int], list[float], tuple, torch.Tensor]:
-        """
-        Generate num_tokens draft tokens using the cached draft model.
-        Each step processes only the new token — O(1) per step instead of O(L).
-
-        Also records the draft model's probability for each token so we don't
-        need a second draft pass during rejection sampling.
-
-        Returns (tokens, token_probs, updated_past_kv, updated_last_logit).
-        """
-        tokens = []
-        token_probs = []
-        kv = draft_past_kv
-        logit = draft_last_logit
-
-        for _ in range(num_tokens):
-            probs = F.softmax(logit / max(temperature, 1e-8), dim=-1)
-            tok = self._sample(logit, temperature).item()
-            token_probs.append(probs[tok].item())
-            tokens.append(tok)
-            if tok == self.target_tokenizer.eos_token_id:
-                break
-            out = self.draft_model(
-                torch.tensor([[tok]], device=self.device),
-                past_key_values=kv,
-                use_cache=True,
-            )
-            kv = out.past_key_values
-            logit = out.logits[0, -1, :]
-
-        return tokens, token_probs, kv, logit
-
-    def _verify_drafts_cached(
-        self,
-        target_last_logit: torch.Tensor,
-        target_past_kv,
-        draft_tokens: list[int],
-        source: str,
-        temperature: float,
-        draft_token_probs: list[float],  # pre-computed by _draft_model_tokens_cached
-        pre_draft_seq_len: int,
-    ) -> tuple[list[int], int | None, tuple, torch.Tensor]:
-        """
-        Single cached target forward pass over draft tokens, followed by one bonus step.
-
-        Uses target_last_logit to verify draft_tokens[0], and the output logits to verify
-        draft_tokens[1..n-1].  After acceptance is determined, the verification KV is
-        cropped to [prefix + accepted] then one target step is run for the bonus token.
-        This replaces the old _advance_target_kv (which reprocessed k+1 tokens from
-        pre_draft_kv) with a single 1-token pass, saving ~k target forward tokens per step.
-
-        Returns (accepted_tokens, bonus_token, new_target_past_kv, new_target_last_logit).
-        """
-        n = len(draft_tokens)
-        if n == 0:
-            return [], None, target_past_kv, target_last_logit
-
-        draft_tensor = torch.tensor([draft_tokens], device=self.device)
-
-        # Single forward pass — only processes n new tokens, not the full prefix
-        out = self.target_model(draft_tensor, past_key_values=target_past_kv, use_cache=True)
-        verify_kv = out.past_key_values  # length = pre_draft_seq_len + n
-
-        # Build verification logit matrix [n, vocab]
-        # verification_logits[i] = P(next | prefix + draft[0..i-1])
-        if n == 1:
-            verification_logits = target_last_logit.unsqueeze(0)
-        else:
-            verification_logits = torch.cat(
-                [target_last_logit.unsqueeze(0), out.logits[0, :-1, :]], dim=0
-            )
-
-        bonus_logit = out.logits[0, -1, :]
-
-        # --- Determine accepted tokens and bonus ---
-        if temperature == 0.0:
-            accepted = []
-            bonus = None
-            for i, tok in enumerate(draft_tokens):
-                best = verification_logits[i].argmax().item()
-                if tok == best:
-                    accepted.append(tok)
-                else:
-                    bonus = best
-                    break
-            if bonus is None:
-                bonus = bonus_logit.argmax().item()
-        else:
-            # Sampled: exact rejection sampling (Leviathan et al. 2023)
-            target_probs = F.softmax(verification_logits / max(temperature, 1e-8), dim=-1)
-            bonus_probs = F.softmax(bonus_logit / max(temperature, 1e-8), dim=-1)
-
-            if source == "SA":
-                # p_draft(t_i) = 1 (deterministic), so accept_prob = min(1, p_target(t_i))
-                accept_probs = target_probs[torch.arange(n), draft_tokens]
-            else:
-                # Use pre-computed draft probabilities (saved during token generation)
-                draft_probs_tensor = torch.tensor(draft_token_probs[:n], device=self.device)
-                target_draft_probs = target_probs[torch.arange(n), draft_tokens]
-                accept_probs = torch.clamp(target_draft_probs / (draft_probs_tensor + 1e-10), max=1.0)
-
-            accepted = []
-            bonus = None
-            for i, tok in enumerate(draft_tokens):
-                if torch.rand(1, device=self.device).item() < accept_probs[i].item():
-                    accepted.append(tok)
-                else:
-                    if source != "SA":
-                        residual = F.relu(target_probs[i] - draft_probs_tensor[i] * target_probs[i])
-                        z = residual.sum()
-                        bonus = (torch.multinomial(residual / z, 1).item() if z > 1e-8
-                                 else target_probs[i].argmax().item())
-                    else:
-                        bonus = torch.multinomial(target_probs[i], 1).item()
-                    break
-            if bonus is None:
-                bonus = torch.multinomial(bonus_probs, 1).item()
-
-        # --- Crop KV to accepted prefix, then run one target step for bonus ---
-        # This replaces _advance_target_kv (which re-ran k+1 tokens from pre_draft_kv)
-        # with a single 1-token pass, saving ~k target forward tokens per speculative step.
-        keep = pre_draft_seq_len + len(accepted)
-        if hasattr(verify_kv, "crop"):
-            verify_kv.crop(keep)
-        else:
-            # Tuple-format KV cache (older transformers): slice each layer manually
-            verify_kv = tuple(
-                (layer_k[:, :, :keep, :], layer_v[:, :, :keep, :])
-                for layer_k, layer_v in verify_kv
-            )
-        bonus_out = self.target_model(
-            torch.tensor([[bonus]], device=self.device),
-            past_key_values=verify_kv,
-            use_cache=True,
-        )
-        return accepted, bonus, bonus_out.past_key_values, bonus_out.logits[0, -1, :]
-
+        new_ids = committed[n_prompt:]
+        metrics = tracker.finalize(total_tokens=len(new_ids), total_time=total_time)
+        return new_ids, metrics

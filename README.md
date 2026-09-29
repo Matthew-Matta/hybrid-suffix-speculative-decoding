@@ -1,10 +1,28 @@
 # Suffix Automaton + Dynamic-Length Speculative Decoding
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Matthew-Matta/BasetenResearch_Project/blob/main/notebooks/demo.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Matthew-Matta/hybrid-suffix-speculative-decoding/blob/main/notebooks/demo.ipynb)
 
 **2.16x throughput vs autoregressive** on repetitive code generation (49.2 vs 22.8 TPS, T4 GPU) using zero-cost suffix automaton drafts with suffix-link fallback.
 
 Implements **dynamic-length speculation**, future work named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) — on top of a full reimplementation of the dual-SA speculative decoding architecture from `sa_spec`, extended with per-source draft routing (SA vs draft model vs AR fallback).
+
+---
+
+## v2 changes (Sept 2026)
+
+v2 fixes correctness and efficiency issues found while reviewing v1. **The result tables further down are from v1**; re-run `notebooks/v2_results.ipynb` for v2 numbers.
+
+| Issue in v1 | Fix in v2 |
+|---|---|
+| Sampled mode was **not exact**: after rejecting an SA draft `x`, the correction token was drawn from the full target distribution `p` (so `x` could be re-drawn, biasing output toward drafted tokens). Draft-model rejections used `p·(1−q(x))` instead of `max(0, p − q)`. | Residual is now `normalize(max(0, p − q))`: for SA drafts that is `p` with `x` zeroed; the draft model keeps its full `q` vector. Verified statistically in `tests/test_rejection_sampling.py`. |
+| **Two target forwards per step**: verify pass, then a separate forward just for the bonus token. | The bonus/correction token becomes `pending` and is fed at the front of the *next* verify batch (`[pending] + drafts`). Every step is exactly one target forward. |
+| Controller never shortened SA drafts (`max(...)` instead of `min(...)`). | Fixed. |
+| Draft model re-ran on committed tokens every step, even SA steps. | Lazy sync: draft KV catches up only when the controller routes to the draft model. |
+| Draft-vs-AR routing used `rate × k > 1` with an assumed cost. | Picks k maximising `E[tokens/step] / (1 + k·c)` with `c` = measured draft/target time ratio; routes to AR when no k beats 1. |
+| AR steps counted as "accepted" drafts, inflating acceptance. | Acceptance is over speculative proposals only; new `tokens_per_target_forward` metric. |
+| Single runs, no variance; no correctness test. | Repeats with mean ± std; greedy output checked token-for-token against AR (`tests/test_equivalence.py`). |
+
+Run tests: `python -m pytest -q tests` (CPU, tiny random models, ~1 min).
 
 ---
 
@@ -30,7 +48,7 @@ Five modes in a single `HybridSpecDecoder.generate()` call:
 | `hybrid_fixed` | SA → draft model fallback | Fixed |
 | `hybrid_dynamic` | SA → draft model fallback | **Adaptive** |
 
-Mathematically exact rejection sampling (Leviathan et al. 2023): `accept_prob = min(1, p_target / p_draft)`. For SA drafts, `p_draft = 1` (deterministic), so `accept_prob = p_target(token)`.
+Exact speculative sampling (Leviathan et al. 2023; Chen et al. 2023): accept with `min(1, p/q)`, otherwise sample from `normalize(max(0, p − q))`. For SA drafts `q` is one-hot, so acceptance is `p(x)` and the residual is `p` with `x` removed.
 
 KV cache maintained across all decoding steps — each forward pass processes only the new draft tokens, not the full growing sequence.
 
@@ -45,7 +63,9 @@ The Section 9 scatter plot visualizes this per-step routing: SA (free), draft mo
 
 ---
 
-## Results (T4 GPU, Colab free tier)
+## Results — v1 (T4 GPU, Colab free tier)
+
+> ⚠️ v1 numbers. The temperature=1.0 rows used the biased v1 sampler; greedy rows are valid but predate the one-forward-per-step fix.
 
 *All numbers from a single end-to-end notebook run. Re-run the Colab to reproduce — numbers vary slightly between runs.*
 
@@ -139,7 +159,7 @@ Prompt tokens
 
 ## Quickstart
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Matthew-Matta/BasetenResearch_Project/blob/main/notebooks/demo.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Matthew-Matta/hybrid-suffix-speculative-decoding/blob/main/notebooks/demo.ipynb)
 
 Single click — runs on a free T4 GPU. No local setup required.
 

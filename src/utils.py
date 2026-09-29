@@ -24,7 +24,10 @@ class GenerationMetrics:
     acceptance_rate: float         # overall (accepted / proposed)
     sa_acceptance_rate: float      # SA-sourced drafts only
     draft_acceptance_rate: float   # draft-model-sourced drafts only
-    avg_draft_length: float
+    avg_draft_length: float          # mean proposed drafts per *speculative* step
+    target_forwards: int = 0         # target-model forward passes (incl. prefill)
+    draft_forwards: int = 0          # draft-model forward passes
+    tokens_per_target_forward: float = 0.0   # generated tokens / decode-time target forwards
     draft_length_history: list[int] = field(default_factory=list)
     source_history: list[str] = field(default_factory=list)  # "SA"|"draft"|"autoregressive"
 
@@ -38,6 +41,9 @@ class GenerationMetrics:
             "sa_acceptance_rate": self.sa_acceptance_rate,
             "draft_acceptance_rate": self.draft_acceptance_rate,
             "avg_draft_length": self.avg_draft_length,
+            "target_forwards": self.target_forwards,
+            "draft_forwards": self.draft_forwards,
+            "tokens_per_target_forward": self.tokens_per_target_forward,
             "draft_length_history": self.draft_length_history,
             "source_history": self.source_history,
         }
@@ -55,6 +61,15 @@ class MetricsTracker:
         self._accepted: dict[str, int] = {"SA": 0, "draft": 0, "autoregressive": 0}
         self._draft_lengths: list[int] = []
         self._sources: list[str] = []
+        self._target_fwd = 0
+        self._draft_fwd = 0
+        self._decode_target_fwd = 0
+
+    def count_target_forward(self, n: int = 1) -> None:
+        self._target_fwd += n
+
+    def count_draft_forward(self, n: int = 1) -> None:
+        self._draft_fwd += n
 
     def record_ttft(self, elapsed: float) -> None:
         if self._ttft is None:
@@ -71,6 +86,7 @@ class MetricsTracker:
         self._accepted[source] += accepted
         self._draft_lengths.append(draft_len)
         self._sources.append(source)
+        self._decode_target_fwd += 1   # every decode step is exactly one target forward
 
     def finalize(self, total_tokens: int, total_time: float) -> GenerationMetrics:
         total_proposed = sum(self._proposed.values())
@@ -80,6 +96,7 @@ class MetricsTracker:
             p = self._proposed[src]
             return self._accepted[src] / p if p > 0 else 0.0
 
+        spec_lens = [d for d, s in zip(self._draft_lengths, self._sources) if s != "autoregressive"]
         return GenerationMetrics(
             tokens_generated=total_tokens,
             wall_time_s=total_time,
@@ -88,7 +105,10 @@ class MetricsTracker:
             acceptance_rate=total_accepted / total_proposed if total_proposed > 0 else 0.0,
             sa_acceptance_rate=_rate("SA"),
             draft_acceptance_rate=_rate("draft"),
-            avg_draft_length=float(np.mean(self._draft_lengths)) if self._draft_lengths else 0.0,
+            avg_draft_length=float(np.mean(spec_lens)) if spec_lens else 0.0,
+            target_forwards=self._target_fwd,
+            draft_forwards=self._draft_fwd,
+            tokens_per_target_forward=total_tokens / self._decode_target_fwd if self._decode_target_fwd else 0.0,
             draft_length_history=list(self._draft_lengths),
             source_history=list(self._sources),
         )
@@ -176,16 +196,19 @@ def plot_benchmark_results(results: dict[str, list[GenerationMetrics]], output_d
 
 def print_summary_table(results: dict[str, list[GenerationMetrics]]) -> None:
     """Print a formatted summary table to stdout."""
-    header = f"{'Method':<22} {'TPS':>8} {'TTFT(s)':>9} {'Accept%':>9} {'SA%':>7} {'Draft%':>8} {'AvgDraftLen':>12}"
+    header = f"{'Method':<22} {'TPS (mean±std)':>16} {'TTFT(s)':>9} {'Accept%':>9} {'SA%':>7} {'Draft%':>8} {'AvgDraftLen':>12} {'Tok/TgtFwd':>11}"
     print("\n" + "=" * len(header))
     print(header)
     print("=" * len(header))
     for method, metrics_list in results.items():
         tps = np.mean([m.tokens_per_second for m in metrics_list])
+        tps_std = np.std([m.tokens_per_second for m in metrics_list])
+        tpf = np.mean([m.tokens_per_target_forward for m in metrics_list])
         ttft = np.mean([m.ttft_s for m in metrics_list])
         acc = np.mean([m.acceptance_rate for m in metrics_list]) * 100
         sa = np.mean([m.sa_acceptance_rate for m in metrics_list]) * 100
         draft = np.mean([m.draft_acceptance_rate for m in metrics_list]) * 100
         adl = np.mean([m.avg_draft_length for m in metrics_list])
-        print(f"{method:<22} {tps:>8.2f} {ttft:>9.4f} {acc:>8.1f}% {sa:>6.1f}% {draft:>7.1f}% {adl:>12.2f}")
+        tps_s = f"{tps:.2f}±{tps_std:.2f}"
+        print(f"{method:<22} {tps_s:>16} {ttft:>9.4f} {acc:>8.1f}% {sa:>6.1f}% {draft:>7.1f}% {adl:>12.2f} {tpf:>11.2f}")
     print("=" * len(header) + "\n")

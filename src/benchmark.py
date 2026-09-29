@@ -184,6 +184,9 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=100)
     parser.add_argument("--num-draft-tokens", type=int, default=4)
     parser.add_argument("--sa-threshold", type=int, default=2)
+    parser.add_argument("--sa-max-draft-len", type=int, default=10)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--repeats", type=int, default=1, help="run each prompt N times (for mean ± std)")
     parser.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--device", default=None)
@@ -215,11 +218,13 @@ def main() -> None:
         print(f"\n--- Running: {method} ---")
         metrics_list = run_benchmark(
             decoder=decoder,
-            prompts=prompts,
+            prompts=prompts * args.repeats,
             method=method,
             max_new_tokens=args.max_new_tokens,
             num_draft_tokens=args.num_draft_tokens,
             sa_threshold=args.sa_threshold,
+            sa_max_draft_len=args.sa_max_draft_len,
+            temperature=args.temperature,
             verbose=args.verbose,
         )
         all_results[method] = metrics_list
