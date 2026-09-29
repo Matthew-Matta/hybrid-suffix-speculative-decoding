@@ -2,7 +2,7 @@
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Matthew-Matta/hybrid-suffix-speculative-decoding/blob/main/notebooks/demo.ipynb)
 
-**2.16x throughput vs autoregressive** on repetitive code generation (49.2 vs 22.8 TPS, T4 GPU) using zero-cost suffix automaton drafts with suffix-link fallback.
+**2.44x throughput vs autoregressive** on repetitive code generation (57.1 ± 4.1 vs 23.4 ± 1.7 TPS, greedy, T4 GPU, 5 repeats) using zero-cost suffix automaton drafts routed by a cost-aware controller. On generic prompts the gain is small (1.05–1.09x), and a 0.5B draft model gives **no** speedup on this hardware despite 88% acceptance — see [v2 results](#results--v2-t4-gpu-colab-free-tier).
 
 Implements **dynamic-length speculation**, future work named in Baseten's [SA MTP blog post (Jan 27, 2026)](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/#suffix-automaton-decoding) — on top of a full reimplementation of the dual-SA speculative decoding architecture from `sa_spec`, extended with per-source draft routing (SA vs draft model vs AR fallback).
 
@@ -10,7 +10,7 @@ Implements **dynamic-length speculation**, future work named in Baseten's [SA MT
 
 ## v2 changes (Sept 2026)
 
-v2 fixes correctness and efficiency issues found while reviewing v1. **The result tables further down are from v1**; re-run `notebooks/v2_results.ipynb` for v2 numbers.
+v2 fixes correctness and efficiency issues found while reviewing v1. The [v2 results](#results--v2-t4-gpu-colab-free-tier) below were re-measured with the fixed code; the v1 tables are kept for comparison.
 
 | Issue in v1 | Fix in v2 |
 |---|---|
@@ -56,12 +56,64 @@ KV cache maintained across all decoding steps — each forward pass processes on
 
 This implementation extends the idea beyond draft **length** to draft **source routing**:
 - Separate rolling-window acceptance rate trackers for SA and draft-model sources
-- Draft length adjusts up/down based on 80%/40% thresholds, clamped to [2, 10]
-- **Cost-aware source routing**: when `rate × draft_len ≤ 1.0`, the draft model is not economical — DLC falls back to autoregressive, avoiding the overhead trap
-
-The Section 9 scatter plot visualizes this per-step routing: SA (free), draft model (when economical), and AR fallback (when neither source justifies overhead).
+- SA draft length adjusts up/down based on 80%/40% acceptance thresholds, clamped to [2, 10]
+- **Cost-aware source routing**: draft-model length k maximises `E[tokens/step] / (1 + k·c)`, where `c` is the measured draft/target forward-time ratio; if no k beats 1, the step falls back to autoregressive
+- Explores the draft model until it has a few observations, then re-probes periodically so a stale estimate can recover
 
 ---
+
+## Results — v2 (T4 GPU, Colab free tier)
+
+Qwen2.5-Coder-1.5B-Instruct target, Qwen2.5-Coder-0.5B-Instruct draft, fp16, batch 1. 5 repeats per config, mean ± std. Produced by [`notebooks/v2_results.ipynb`](notebooks/v2_results.ipynb); raw data in [`results/v2_results.json`](results/v2_results.json).
+
+![v2 throughput](results/figures/v2_tps.png)
+
+### Repetitive code prompt, greedy (300 tokens)
+
+| Mode | TPS | Speedup | Tokens / target forward | Acceptance (SA / draft) |
+|---|---|---|---|---|
+| autoregressive | 23.4 ± 1.7 | 1.00x | 1.00 | – |
+| specdec | 23.5 ± 2.1 | 1.00x | 4.48 | – / 87.9% |
+| sa_only | 44.9 ± 20.2 | 1.92x | 3.12 | 39.5% / – |
+| hybrid_fixed | 54.3 ± 8.9 | 2.32x | 5.17 | 46.3% / 90.0% |
+| **hybrid_dynamic** | **57.1 ± 4.1** | **2.44x** | 2.61 | 65.0% / 76.7% |
+
+### Repetitive code prompt, sampled (temperature 1.0, 300 tokens)
+
+| Mode | TPS | Speedup | Tokens / target forward | Acceptance (SA / draft) |
+|---|---|---|---|---|
+| autoregressive | 22.5 ± 4.1 | 1.00x | 1.00 | – |
+| specdec | 24.3 ± 2.1 | 1.08x | 4.26 | – / 82.1% |
+| **sa_only** | **49.1 ± 13.0** | **2.18x** | 1.97 | 36.4% / – |
+| hybrid_fixed | 31.2 ± 5.6 | 1.39x | 3.94 | 39.6% / 58.6% |
+| hybrid_dynamic | 38.2 ± 7.1 | 1.70x | 1.79 | 50.8% / 61.6% |
+
+### 10 generic code prompts, greedy (128 tokens)
+
+| Mode | TPS | Speedup | Tokens / target forward |
+|---|---|---|---|
+| autoregressive | 24.0 ± 1.4 | 1.00x | 1.00 |
+| specdec | 22.5 ± 3.0 | 0.94x | 4.05 |
+| sa_only | 26.2 ± 1.5 | 1.09x | 1.09 |
+| hybrid_fixed | 23.4 ± 1.9 | 0.97x | 3.82 |
+| hybrid_dynamic | 25.1 ± 1.4 | 1.05x | 1.23 |
+
+### Why the draft model doesn't help here: the regime is overhead-bound
+
+![verify cost vs k](results/figures/verify_cost_vs_k.png)
+
+| | Target (1.5B) | Draft (0.5B) |
+|---|---|---|
+| Layers | 28 | 24 |
+| 1-token forward, 512-token context | 38.2 ms | 45.0 ms |
+| Bandwidth roofline (weights / 320 GB/s) | 9.7 ms | – |
+
+* A target forward takes ~4x its bandwidth roofline, and verifying up to 64 tokens costs about the same as one: per-step cost is dominated by kernel-launch / Python overhead, which scales with **layer count**, not parameters.
+* The draft has 0.32x the parameters but 0.86x the layers, and its forward is actually *slower* than the target's (c = 1.18).
+* With c ≥ 1 a draft model can never win at any acceptance rate: even at 100% acceptance, k drafts yield (k+1) tokens for (1 + k·c) ≥ (k+1) target-forward-equivalents. That is exactly what specdec shows: 4.48 tokens per target forward, 1.00x speedup.
+* The cost-aware controller in `hybrid_dynamic` learns this and falls back to SA/AR; its remaining draft probes are why it trails `sa_only` in the sampled run.
+
+**Measurement caveat.** Greedy repeats do identical work (same tokens, same forward counts), yet `sa_only` wall time ranged from 3.7 s to 9.5 s across repeats. That is Colab T4 timing noise, not the algorithm (an SA query costs ~0.01 ms). *Tokens per target forward* is deterministic under greedy decoding and is the more reliable comparison.
 
 ## Results — v1 (T4 GPU, Colab free tier)
 
@@ -81,7 +133,7 @@ The showcase prompt provides two fully-implemented Calculator methods and asks t
 
 **sa_only at 2.16x** is the headline: suffix-link fallback produces ~6 draft tokens per SA firing (up from ~1.3 before the fix), and every accepted token is pure profit since SA proposals are dict lookups — zero forward passes.
 
-`hybrid_dynamic` is slower here because the DLC occasionally routes to the draft model, which is net negative at this 3x model ratio. On production hardware with a 10x+ ratio, the hybrid mode would benefit from both sources.
+`hybrid_dynamic` was slower in v1 because its controller never shortened drafts and routed to the draft model with an assumed cost; see v2 for the measured cost model.
 
 ### Greedy SA showcase — SA's best case (temperature=0)
 
@@ -106,18 +158,9 @@ On diverse, non-repetitive prompts (glaiveai/code_edits_sample), SA fires less o
 | `hybrid_fixed` | 8.5 | 25.8% | 9.5% | 29.6% | 4.34 |
 | `hybrid_dynamic` | 12.0 | 53.7% | 8.6% | 24.7% | 1.96 |
 
-SA breaks even on generic prompts (no downside — zero-cost proposals), while the DLC in `hybrid_dynamic` correctly routes away from the draft model when it's not economical (12.0 vs 8.5 TPS for `hybrid_fixed`).
+SA breaks even on generic prompts (no downside — zero-cost proposals).
 
-### Why draft-model specdec is slower at this model ratio
-
-With a 3x ratio (1.5B/0.5B), the draft model costs ~0.4x per token — too expensive for its acceptance rate:
-
-```
-3x ratio (this repo):   4 drafts × 0.4x + 1 verify = 2.6x cost → 1.1 tokens/cycle → 0.42x (slower)
-10x ratio (production):  4 drafts × 0.1x + 1 verify = 1.4x cost → 3.4 tokens/cycle → 2.4x speedup
-```
-
-SA sidesteps this entirely: 0 forward passes per draft token. The DLC recognizes when draft-model speculation isn't economical (`rate × draft_len ≤ 1.0`) and falls back to AR automatically — visible in the hybrid_dynamic source routing scatter plot (Section 9 of the notebook).
+v1 attributed the draft model's slowdown to the 3x parameter ratio. The v2 measurements show the real cause: at batch 1 on a T4 the draft's forward pass is *slower* than the target's, because cost tracks layer count rather than parameters (see [v2](#why-the-draft-model-doesnt-help-here-the-regime-is-overhead-bound)).
 
 ---
 
@@ -139,7 +182,7 @@ Prompt tokens
 │  SA window:    [...]         │  ◄── per-source rolling acceptance
 │  draft window: [...]         │
 └──────────┬───────────────────┘
-           │ get_draft_length(source)
+           │ draft length + source    
            ▼
 ┌─────────────────────────────────────────┐
 │           HybridSpecDecoder             │
@@ -147,7 +190,7 @@ Prompt tokens
 │  if SA match ≥ threshold:               │   │  Draft Model     │
 │      use SA drafts (p_draft = 1)        │◄──│  Qwen2.5-0.5B   │
 │  else:                                  │   └──────────────────┘
-│      use draft model tokens             │
+│      draft model or AR (cost model)     │
 │                                         │   ┌──────────────────┐
 │  single target forward pass (KV cached) │──►│  Target Model    │
 │  exact rejection sampling               │   │  Qwen2.5-1.5B   │
@@ -186,11 +229,16 @@ src/
   speculative_decode.py # HybridSpecDecoder, DynamicLengthController
   benchmark.py          # 5-method benchmark harness with CLI
   utils.py              # MetricsTracker, GenerationMetrics, plots
+tests/
+  test_rejection_sampling.py  # output distribution == p (statistical), controller routing
+  test_equivalence.py         # greedy output == autoregressive, token for token, all modes
+  test_suffix_automaton.py    # SA construction and queries
 notebooks/
-  demo.ipynb            # Colab-ready walkthrough (10 sections)
+  demo.ipynb            # Colab-ready walkthrough (10 sections, v1)
+  v2_results.ipynb      # Cost model + repeated benchmarks behind the v2 results
 results/
-  benchmarks.json       # Raw metrics (generated at runtime)
-  figures/              # TPS bar chart, draft length plot, acceptance breakdown
+  v2_results.json       # Raw v2 metrics (T4)
+  figures/              # v2_tps.png, verify_cost_vs_k.png
 ```
 
 ---
